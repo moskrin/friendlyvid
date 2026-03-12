@@ -56,4 +56,4 @@ cargo run --release
 
 ## License
 
-TBD
+[MIT](LICENSE)
