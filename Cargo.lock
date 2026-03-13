@@ -1305,6 +1305,7 @@ dependencies = [
  "gstreamer-editing-services",
  "gstreamer-pbutils",
  "gstreamer-video",
+ "image",
  "log",
  "pango",
  "pangocairo",

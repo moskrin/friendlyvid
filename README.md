@@ -4,6 +4,8 @@ A dead-simple video editor for Linux. Load video, trim, split, reorder, add tran
 
 Built in Rust with [egui](https://github.com/emilk/egui) and [GStreamer](https://gstreamer.freedesktop.org/) (GES).
 
+![Screenshot]((/screenshot.png)
+
 ## Features
 
 - **Multi-track timeline** - Video, Audio, and Text tracks with clip rendering and time ruler
