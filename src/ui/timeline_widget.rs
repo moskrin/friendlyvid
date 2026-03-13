@@ -731,7 +731,7 @@ pub fn show_timeline(
         let scroll = ui.input(|i| i.smooth_scroll_delta);
         if scroll.y != 0.0 {
             let factor = 1.0 + (scroll.y as f64 * 0.005);
-            view.zoom = (view.zoom * factor).clamp(20.0, 1000.0);
+            view.zoom = (view.zoom * factor).clamp(2.0, 1000.0);
         }
         if scroll.x != 0.0 {
             view.scroll_offset -= scroll.x as f64 / view.zoom;
