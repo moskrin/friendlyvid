@@ -56,6 +56,14 @@ Or for an optimized build:
 cargo run --release
 ```
 
+## Install
+
+To install a .desktop file with accompanying icons:
+
+```bash
+friendlyvid --install
+```
+
 ## License
 
 [MIT](LICENSE)
