@@ -318,13 +318,17 @@ fn finish_crop(
     commands: &mut CommandHistory,
     engine: &mut MediaEngine,
 ) {
-    if let Some(result) = layout.preview_panel.exit_crop_mode() {
+    let result = layout.preview_panel.exit_crop_mode();
+    // Clear the bypass before syncing so the pipeline picks up the new
+    // (or original, if no change) videocrop state.
+    engine.set_crop_bypass(None);
+    if let Some(result) = result {
         let cmd = SetCropCommand::new(result.clip_id, result.old_transform, result.new_transform);
         if let Err(e) = commands.execute(Box::new(cmd), state) {
             log::error!("Set crop failed: {}", e);
         }
-        sync_engine(engine, &state.project);
     }
+    sync_engine(engine, &state.project);
 }
 
 fn handle_toolbar_actions(
@@ -374,6 +378,10 @@ fn handle_toolbar_actions(
                 layout
                     .preview_panel
                     .enter_crop_mode(clip_id, clip.transform.clone());
+                // Bypass the clip's videocrop while in crop mode so the
+                // preview's UV crop operates on the uncropped source.
+                engine.set_crop_bypass(Some(clip_id));
+                sync_engine(engine, &state.project);
             }
         }
     }
@@ -665,6 +673,8 @@ fn handle_keyboard_shortcuts(
     // Escape cancels crop mode (discards changes) or text edit mode
     if escape && layout.preview_panel.crop_mode {
         layout.preview_panel.cancel_crop_mode();
+        engine.set_crop_bypass(None);
+        sync_engine(engine, &state.project);
         return;
     }
     if escape && layout.preview_panel.text_edit_clip_id.is_some() {

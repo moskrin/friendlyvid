@@ -12,6 +12,7 @@ use gstreamer_video as gst_video;
 use pango::prelude::*;
 use std::path::Path;
 use std::time::Duration;
+use uuid::Uuid;
 
 use super::frame_grabber::VideoFrame;
 use crate::model::{Project, TransitionKind, TransitionPosition};
@@ -52,6 +53,10 @@ pub struct MediaEngine {
     transition_breakpoints: Vec<TransitionBreakpoint>,
     pub export_state: ExportState,
     export_path: Option<std::path::PathBuf>,
+    // While a clip is being interactively cropped, its videocrop effect is
+    // skipped so the preview sees the uncropped source. The UV crop in the
+    // preview panel then renders the live framing on top of the raw frame.
+    crop_bypass_clip: Option<Uuid>,
 }
 
 fn path_to_uri(path: &Path) -> Result<String> {
@@ -112,7 +117,15 @@ impl MediaEngine {
             transition_breakpoints: Vec::new(),
             export_state: ExportState::Idle,
             export_path: None,
+            crop_bypass_clip: None,
         }
+    }
+
+    /// When set, `sync_from_model` will skip the videocrop effect for this
+    /// clip so the pipeline emits an uncropped frame. Used during interactive
+    /// crop mode.
+    pub fn set_crop_bypass(&mut self, clip_id: Option<Uuid>) {
+        self.crop_bypass_clip = clip_id;
     }
 
     fn ensure_pipeline(&mut self) -> Result<()> {
@@ -306,13 +319,21 @@ impl MediaEngine {
                                 );
                             }
 
-                            // Apply videocrop effect if clip has zoom/crop
-                            if clip.transform.has_crop() {
+                            // Apply videocrop effect if clip has zoom/crop,
+                            // unless this clip is currently being interactively cropped.
+                            // The videoscale+capsfilter after the crop rescales the cropped
+                            // region back to the source's native dimensions so the GES
+                            // compositor sees a constant frame size. Without this, the
+                            // cropped frame is pasted at its smaller post-crop size onto
+                            // the compositor canvas, appearing in the top-left with black
+                            // around it.
+                            let skip_crop = self.crop_bypass_clip == Some(clip.id);
+                            if clip.transform.has_crop() && !skip_crop {
                                 let (top, bottom, left, right) =
                                     clip.transform.crop_pixels(source.width, source.height);
                                 let desc = format!(
-                                    "videocrop top={} bottom={} left={} right={}",
-                                    top, bottom, left, right
+                                    "videocrop top={} bottom={} left={} right={} ! videoscale ! capsfilter caps=video/x-raw,width={},height={}",
+                                    top, bottom, left, right, source.width, source.height
                                 );
                                 match ges::Effect::new(&desc) {
                                     Ok(effect) => {

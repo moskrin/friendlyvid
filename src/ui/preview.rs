@@ -186,10 +186,18 @@ impl PreviewPanel {
                 let max_h = video_area_height.max(100.0);
                 let (w, h) = fit_size(max_w, max_h, aspect);
 
-                let uv = if let Some(ref t) = display_transform {
-                    if t.has_crop() {
-                        let (l, t, r, b) = t.crop_uv();
-                        egui::Rect::from_min_max(egui::pos2(l, t), egui::pos2(r, b))
+                // UV cropping is only used during live crop mode, where the pipeline
+                // has NOT yet had the new crop baked in. Once committed, the GES
+                // videocrop effect emits an already-cropped frame — applying UV
+                // crop on top of that would double-crop the preview.
+                let uv = if self.crop_mode {
+                    if let Some(ref t) = display_transform {
+                        if t.has_crop() {
+                            let (l, t, r, b) = t.crop_uv();
+                            egui::Rect::from_min_max(egui::pos2(l, t), egui::pos2(r, b))
+                        } else {
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0))
+                        }
                     } else {
                         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0))
                     }
