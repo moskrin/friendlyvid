@@ -10,6 +10,7 @@ use gstreamer_editing_services::prelude::*;
 use gstreamer_pbutils as gst_pbutils;
 use gstreamer_video as gst_video;
 use pango::prelude::*;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 use uuid::Uuid;
@@ -24,6 +25,18 @@ struct TransitionBreakpoint {
     ges_overlap_end: Duration,   // GES time when overlap ends (clip A ends)
     offset_before: Duration,     // cumulative offset before this transition
     offset_after: Duration,      // cumulative offset after this transition
+}
+
+/// Cache key for a videocrop effect. If these values match, we can reuse the
+/// existing GES Effect instead of running parse-launch again.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CropParams {
+    top: i32,
+    bottom: i32,
+    left: i32,
+    right: i32,
+    source_w: u32,
+    source_h: u32,
 }
 
 pub struct MediaInfo {
@@ -57,6 +70,13 @@ pub struct MediaEngine {
     // skipped so the preview sees the uncropped source. The UV crop in the
     // preview panel then renders the live framing on top of the raw frame.
     crop_bypass_clip: Option<Uuid>,
+    // Cached GES UriClips and crop Effects, keyed by model clip Uuid. Diff-based
+    // sync_from_model reuses these across edits instead of tearing down the
+    // timeline every call. Avoids hammering the GES asset/discoverer cache and
+    // gst_parse_bin_from_description_full.
+    video_clip_cache: HashMap<Uuid, ges::UriClip>,
+    audio_clip_cache: HashMap<Uuid, ges::UriClip>,
+    crop_effect_cache: HashMap<Uuid, (CropParams, ges::Effect)>,
 }
 
 fn path_to_uri(path: &Path) -> Result<String> {
@@ -118,6 +138,9 @@ impl MediaEngine {
             export_state: ExportState::Idle,
             export_path: None,
             crop_bypass_clip: None,
+            video_clip_cache: HashMap::new(),
+            audio_clip_cache: HashMap::new(),
+            crop_effect_cache: HashMap::new(),
         }
     }
 
@@ -126,6 +149,94 @@ impl MediaEngine {
     /// crop mode.
     pub fn set_crop_bypass(&mut self, clip_id: Option<Uuid>) {
         self.crop_bypass_clip = clip_id;
+    }
+
+    /// Look up or construct the GES UriClip for a model video clip, adding it
+    /// to the layer on first use. Returns None on failure.
+    fn get_or_create_video_clip(
+        &mut self,
+        clip_id: Uuid,
+        path: &Path,
+        layer: &ges::Layer,
+    ) -> Result<Option<ges::UriClip>> {
+        if let Some(c) = self.video_clip_cache.get(&clip_id) {
+            return Ok(Some(c.clone()));
+        }
+        let uri = path_to_uri(path)?;
+        match ges::UriClip::new(&uri) {
+            Ok(c) => {
+                if let Err(e) = layer.add_clip(&c) {
+                    log::error!("Failed to add clip {} to GES layer: {}", clip_id, e);
+                    return Ok(None);
+                }
+                self.video_clip_cache.insert(clip_id, c.clone());
+                Ok(Some(c))
+            }
+            Err(e) => {
+                log::error!("Failed to create GES UriClip for {}: {}", path.display(), e);
+                Ok(None)
+            }
+        }
+    }
+
+    fn get_or_create_audio_clip(
+        &mut self,
+        clip_id: Uuid,
+        path: &Path,
+        layer: &ges::Layer,
+    ) -> Result<Option<ges::UriClip>> {
+        if let Some(c) = self.audio_clip_cache.get(&clip_id) {
+            return Ok(Some(c.clone()));
+        }
+        let uri = path_to_uri(path)?;
+        match ges::UriClip::new(&uri) {
+            Ok(c) => {
+                if let Err(e) = layer.add_clip(&c) {
+                    log::error!("Failed to add audio clip {} to GES layer: {}", clip_id, e);
+                    return Ok(None);
+                }
+                self.audio_clip_cache.insert(clip_id, c.clone());
+                Ok(Some(c))
+            }
+            Err(e) => {
+                log::error!(
+                    "Failed to create GES audio UriClip for {}: {}",
+                    path.display(),
+                    e
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// Ensure the given GES clip has a crop effect matching `params`. If the
+    /// cached effect already matches, do nothing. Otherwise replace.
+    /// This is the hot path: avoiding a redundant ges::Effect::new call also
+    /// avoids gst_parse_bin_from_description_full, which churns the GES asset
+    /// cache and (in GES 1.26.2) appears to corrupt the heap over time.
+    fn ensure_crop_effect(&mut self, clip_id: Uuid, ges_clip: &ges::UriClip, params: CropParams) {
+        if let Some((cached, _)) = self.crop_effect_cache.get(&clip_id) {
+            if *cached == params {
+                return;
+            }
+        }
+        if let Some((_, old_eff)) = self.crop_effect_cache.remove(&clip_id) {
+            let _ = ges_clip.remove(&old_eff);
+        }
+        let desc = format!(
+            "videocrop top={} bottom={} left={} right={} ! videoscale ! capsfilter caps=video/x-raw,width={},height={}",
+            params.top, params.bottom, params.left, params.right, params.source_w, params.source_h
+        );
+        match ges::Effect::new(&desc) {
+            Ok(effect) => {
+                if let Err(e) = ges_clip.add_top_effect(&effect, 0) {
+                    log::error!("Failed to add crop effect: {}", e);
+                } else {
+                    self.crop_effect_cache.insert(clip_id, (params, effect));
+                }
+            }
+            Err(e) => log::error!("Failed to create crop effect: {}", e),
+        }
     }
 
     fn ensure_pipeline(&mut self) -> Result<()> {
@@ -230,13 +341,20 @@ impl MediaEngine {
     /// Model clip positions are NOT modified. GES clips are shifted to create
     /// overlaps where transitions exist, and breakpoints are stored for
     /// GES<->model time conversion.
+    ///
+    /// Diff-based: existing GES UriClips and crop Effects are reused across
+    /// calls, keyed by model clip Uuid. Only positions/durations are updated
+    /// when a clip is unchanged structurally. Transition clips are recreated
+    /// each call (cheap; no parse-launch).
     pub fn sync_from_model(&mut self, project: &Project) -> Result<()> {
         self.ensure_pipeline()?;
         log::debug!("sync_from_model: starting");
 
-        let pipeline = self.ges_pipeline.as_ref().unwrap();
-        let layer = self.ges_layer.as_ref().unwrap();
-        let ges_timeline = self.ges_timeline.as_ref().unwrap();
+        // Clone refcounted handles so we can borrow self mutably below for caches.
+        let pipeline = self.ges_pipeline.clone().unwrap();
+        let layer = self.ges_layer.clone().unwrap();
+        let audio_layer = self.ges_audio_layer.clone().unwrap();
+        let ges_timeline = self.ges_timeline.clone().unwrap();
 
         // Save playback state and position
         let (_, current_state, _) = pipeline.state(gst::ClockTime::ZERO);
@@ -246,9 +364,42 @@ impl MediaEngine {
         // Disable auto-transitions - we manually create TransitionClips with correct vtype
         layer.set_auto_transition(false);
 
-        log::debug!("sync_from_model: clearing old clips");
-        for clip in layer.clips() {
-            let _ = layer.remove_clip(&clip);
+        // Remove only TransitionClips from the video layer; cached UriClips stay
+        // attached. Transitions are cheap to recreate (no parse-launch).
+        for c in layer.clips() {
+            if c.dynamic_cast_ref::<ges::BaseTransitionClip>().is_some() {
+                let _ = layer.remove_clip(&c);
+            }
+        }
+
+        // Drop cached UriClips (and their cached effects) for clips that no
+        // longer exist in the model.
+        let video_ids: HashSet<Uuid> =
+            project.timeline.video_track.clips.iter().copied().collect();
+        let stale_video: Vec<Uuid> = self
+            .video_clip_cache
+            .keys()
+            .filter(|id| !video_ids.contains(id))
+            .copied()
+            .collect();
+        for id in stale_video {
+            if let Some(uri_clip) = self.video_clip_cache.remove(&id) {
+                let _ = layer.remove_clip(&uri_clip);
+            }
+            self.crop_effect_cache.remove(&id);
+        }
+        let audio_ids: HashSet<Uuid> =
+            project.timeline.audio_track.clips.iter().copied().collect();
+        let stale_audio: Vec<Uuid> = self
+            .audio_clip_cache
+            .keys()
+            .filter(|id| !audio_ids.contains(id))
+            .copied()
+            .collect();
+        for id in stale_audio {
+            if let Some(uri_clip) = self.audio_clip_cache.remove(&id) {
+                let _ = audio_layer.remove_clip(&uri_clip);
+            }
         }
 
         // Build GES timeline with adjusted positions for transitions.
@@ -261,8 +412,9 @@ impl MediaEngine {
         let video_clips = &project.timeline.video_track.clips;
 
         log::debug!(
-            "sync_from_model: adding {} clips from model",
-            video_clips.len()
+            "sync_from_model: syncing {} video clips (cached: {})",
+            video_clips.len(),
+            self.video_clip_cache.len()
         );
 
         for (i, clip_id) in video_clips.iter().enumerate() {
@@ -297,63 +449,40 @@ impl MediaEngine {
                 let ges_start = clip.start.saturating_sub(accumulated_offset);
 
                 if let Some(source) = project.get_source(clip.source_id) {
-                    let uri = path_to_uri(&source.path)?;
-                    log::debug!(
-                        "sync_from_model: clip {} ges_start={:?} (model_start={:?}, offset={:?})",
-                        source.filename(),
-                        ges_start,
-                        clip.start,
-                        accumulated_offset
-                    );
-                    match ges::UriClip::new(&uri) {
-                        Ok(ges_clip) => {
-                            ges_clip.set_start(dur_to_clocktime(ges_start));
-                            ges_clip.set_duration(dur_to_clocktime(clip.duration));
-                            ges_clip.set_inpoint(dur_to_clocktime(clip.in_point));
+                    let ges_clip =
+                        match self.get_or_create_video_clip(*clip_id, &source.path, &layer)? {
+                            Some(c) => c,
+                            None => continue,
+                        };
 
-                            if let Err(e) = layer.add_clip(&ges_clip) {
-                                log::error!(
-                                    "Failed to add clip {} to GES layer: {}",
-                                    clip.id,
-                                    e
-                                );
-                            }
+                    ges_clip.set_start(dur_to_clocktime(ges_start));
+                    ges_clip.set_duration(dur_to_clocktime(clip.duration));
+                    ges_clip.set_inpoint(dur_to_clocktime(clip.in_point));
 
-                            // Apply videocrop effect if clip has zoom/crop,
-                            // unless this clip is currently being interactively cropped.
-                            // The videoscale+capsfilter after the crop rescales the cropped
-                            // region back to the source's native dimensions so the GES
-                            // compositor sees a constant frame size. Without this, the
-                            // cropped frame is pasted at its smaller post-crop size onto
-                            // the compositor canvas, appearing in the top-left with black
-                            // around it.
-                            let skip_crop = self.crop_bypass_clip == Some(clip.id);
-                            if clip.transform.has_crop() && !skip_crop {
-                                let (top, bottom, left, right) =
-                                    clip.transform.crop_pixels(source.width, source.height);
-                                let desc = format!(
-                                    "videocrop top={} bottom={} left={} right={} ! videoscale ! capsfilter caps=video/x-raw,width={},height={}",
-                                    top, bottom, left, right, source.width, source.height
-                                );
-                                match ges::Effect::new(&desc) {
-                                    Ok(effect) => {
-                                        if let Err(e) = ges_clip.add_top_effect(&effect, 0) {
-                                            log::error!("Failed to add crop effect: {}", e);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        log::error!("Failed to create crop effect: {}", e);
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            log::error!(
-                                "Failed to create GES UriClip for {}: {}",
-                                source.path.display(),
-                                e
-                            );
-                        }
+                    // Apply videocrop effect if clip has zoom/crop,
+                    // unless this clip is currently being interactively cropped.
+                    // The videoscale+capsfilter after the crop rescales the cropped
+                    // region back to the source's native dimensions so the GES
+                    // compositor sees a constant frame size. Without this, the
+                    // cropped frame is pasted at its smaller post-crop size onto
+                    // the compositor canvas, appearing in the top-left with black
+                    // around it.
+                    let skip_crop = self.crop_bypass_clip == Some(clip.id);
+                    let want_crop = clip.transform.has_crop() && !skip_crop;
+                    if want_crop {
+                        let (top, bottom, left, right) =
+                            clip.transform.crop_pixels(source.width, source.height);
+                        let new_params = CropParams {
+                            top,
+                            bottom,
+                            left,
+                            right,
+                            source_w: source.width,
+                            source_h: source.height,
+                        };
+                        self.ensure_crop_effect(*clip_id, &ges_clip, new_params);
+                    } else if let Some((_, old_eff)) = self.crop_effect_cache.remove(clip_id) {
+                        let _ = ges_clip.remove(&old_eff);
                     }
                 }
 
@@ -363,61 +492,41 @@ impl MediaEngine {
 
         // Add manually created TransitionClips at each overlap
         for (start, duration, kind) in &pending_transitions {
-            add_manual_transition(layer, *start, *duration, *kind);
+            add_manual_transition(&layer, *start, *duration, *kind);
         }
 
         self.transition_breakpoints = breakpoints;
 
-        // Sync audio track clips to the audio layer (with transition-aware overlaps)
-        if let Some(ref audio_layer) = self.ges_audio_layer {
-            for clip in audio_layer.clips() {
-                let _ = audio_layer.remove_clip(&clip);
-            }
+        // Sync audio track clips to the audio layer (with transition-aware overlaps).
+        // Audio uses auto-transitions on the layer, so we don't manually add
+        // TransitionClips here. UriClips are cached the same way as video.
+        let audio_clips = &project.timeline.audio_track.clips;
+        let mut audio_accumulated_offset = Duration::ZERO;
 
-            let audio_clips = &project.timeline.audio_track.clips;
-            let mut audio_accumulated_offset = Duration::ZERO;
-
-            for (i, clip_id) in audio_clips.iter().enumerate() {
-                if let Some(clip) = project.timeline.get_clip(*clip_id) {
-                    // Check for transition with previous audio clip
-                    if i > 0 {
-                        let prev_id = audio_clips[i - 1];
-                        let trans_pos = TransitionPosition::Between(prev_id, *clip_id);
-                        if let Some(transition) = project.timeline.find_transition(&trans_pos) {
-                            audio_accumulated_offset += transition.duration;
-                            log::debug!(
-                                "sync_from_model: audio transition between clips, offset now {:?}",
-                                audio_accumulated_offset
-                            );
-                        }
+        for (i, clip_id) in audio_clips.iter().enumerate() {
+            if let Some(clip) = project.timeline.get_clip(*clip_id) {
+                if i > 0 {
+                    let prev_id = audio_clips[i - 1];
+                    let trans_pos = TransitionPosition::Between(prev_id, *clip_id);
+                    if let Some(transition) = project.timeline.find_transition(&trans_pos) {
+                        audio_accumulated_offset += transition.duration;
                     }
+                }
 
-                    let ges_start = clip.start.saturating_sub(audio_accumulated_offset);
+                let ges_start = clip.start.saturating_sub(audio_accumulated_offset);
 
-                    if let Some(source) = project.get_source(clip.source_id) {
-                        let uri = path_to_uri(&source.path)?;
-                        match ges::UriClip::new(&uri) {
-                            Ok(ges_clip) => {
-                                ges_clip.set_start(dur_to_clocktime(ges_start));
-                                ges_clip.set_duration(dur_to_clocktime(clip.duration));
-                                ges_clip.set_inpoint(dur_to_clocktime(clip.in_point));
-                                if let Err(e) = audio_layer.add_clip(&ges_clip) {
-                                    log::error!(
-                                        "Failed to add audio clip {} to GES layer: {}",
-                                        clip.id,
-                                        e
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                log::error!(
-                                    "Failed to create GES audio UriClip for {}: {}",
-                                    source.path.display(),
-                                    e
-                                );
-                            }
-                        }
-                    }
+                if let Some(source) = project.get_source(clip.source_id) {
+                    let ges_clip = match self.get_or_create_audio_clip(
+                        *clip_id,
+                        &source.path,
+                        &audio_layer,
+                    )? {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    ges_clip.set_start(dur_to_clocktime(ges_start));
+                    ges_clip.set_duration(dur_to_clocktime(clip.duration));
+                    ges_clip.set_inpoint(dur_to_clocktime(clip.in_point));
                 }
             }
         }
@@ -543,6 +652,9 @@ impl MediaEngine {
         self.ges_audio_layer = None;
         self.export_text_clips.clear();
         self.transition_breakpoints.clear();
+        self.video_clip_cache.clear();
+        self.audio_clip_cache.clear();
+        self.crop_effect_cache.clear();
         // Drain frame channel
         while self.frame_rx.try_recv().is_ok() {}
     }

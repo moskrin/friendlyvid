@@ -910,7 +910,7 @@ fn show_junction_menu(
                 i.pointer.any_pressed()
                     && i.pointer
                         .latest_pos()
-                        .map_or(false, |p| !dur_rect.contains(p))
+                        .is_some_and(|p| !dur_rect.contains(p))
             });
             if clicked_outside {
                 keep_open = false;
@@ -954,7 +954,7 @@ fn show_junction_menu(
         if keep_open && !matches!(menu_state.phase, MenuPhase::DurationDialog { .. }) {
             let clicked_outside = ui.input(|i| {
                 i.pointer.any_pressed()
-                    && i.pointer.latest_pos().map_or(false, |p| {
+                    && i.pointer.latest_pos().is_some_and(|p| {
                         !main_rect.contains(p) && !sub_rect.contains(p)
                     })
             });
@@ -969,7 +969,7 @@ fn show_junction_menu(
                 i.pointer.any_pressed()
                     && i.pointer
                         .latest_pos()
-                        .map_or(false, |p| !main_rect.contains(p))
+                        .is_some_and(|p| !main_rect.contains(p))
             });
             if clicked_outside || escape_pressed {
                 keep_open = false;
@@ -1079,7 +1079,7 @@ fn show_clip_context_menu(
             i.pointer.any_pressed()
                 && i.pointer
                     .latest_pos()
-                    .map_or(false, |p| !menu_rect.contains(p))
+                    .is_some_and(|p| !menu_rect.contains(p))
         });
         if clicked_outside || escape_pressed {
             keep_open = false;

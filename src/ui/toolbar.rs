@@ -1,5 +1,6 @@
 use egui;
 
+#[derive(Default)]
 pub struct ToolbarAction {
     pub new_project: bool,
     pub open_file: bool,
@@ -13,25 +14,6 @@ pub struct ToolbarAction {
     pub undo: bool,
     pub redo: bool,
     pub crop: bool,
-}
-
-impl Default for ToolbarAction {
-    fn default() -> Self {
-        Self {
-            new_project: false,
-            open_file: false,
-            open_project: false,
-            save_project: false,
-            save_project_as: false,
-            export: false,
-            exit: false,
-            split: false,
-            delete: false,
-            undo: false,
-            redo: false,
-            crop: false,
-        }
-    }
 }
 
 pub fn show_toolbar(

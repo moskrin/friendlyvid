@@ -131,6 +131,7 @@ impl PreviewPanel {
         self.crop_changed = false;
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
@@ -405,10 +406,11 @@ impl PreviewPanel {
                                         }
                                     }
                                 }
-                                if !hit_handle {
-                                    if selected_text_rect.map_or(false, |r| r.expand(4.0).contains(click_pos)) {
-                                        self.text_drag_mode = TextDragMode::Moving;
-                                    }
+                                if !hit_handle
+                                    && selected_text_rect
+                                        .is_some_and(|r| r.expand(4.0).contains(click_pos))
+                                {
+                                    self.text_drag_mode = TextDragMode::Moving;
                                 }
                             }
                         }

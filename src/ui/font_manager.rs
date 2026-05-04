@@ -46,7 +46,7 @@ impl FontManager {
         use font_kit::source::SystemSource;
         match SystemSource::new().all_families() {
             Ok(mut families) => {
-                families.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+                families.sort_by_key(|a| a.to_lowercase());
                 families.dedup();
                 self.system_families = families;
             }

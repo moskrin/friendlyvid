@@ -196,7 +196,7 @@ pub fn show_main_layout(
     let mut remove_source_id: Option<uuid::Uuid> = None;
     egui::CentralPanel::default().show(ctx, |ui| {
         let available = ui.available_size();
-        let browser_width = (available.x * 0.25).max(150.0).min(300.0);
+        let browser_width = (available.x * 0.25).clamp(150.0, 300.0);
 
         ui.horizontal(|ui| {
             ui.allocate_ui(egui::vec2(browser_width, available.y), |ui| {
