@@ -3,7 +3,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use super::Command;
-use crate::model::{Clip, SourceFile, TextOverlay, Transition, TrackKind};
+use crate::model::{Clip, SourceFile, TextOverlay, Transition, TransitionPosition, TrackKind};
 use crate::state::AppState;
 
 #[allow(dead_code)]
@@ -181,6 +181,10 @@ pub struct SplitClipCommand {
     split_at: Duration,
     new_clip_id: Uuid,
     original_duration: Option<Duration>,
+    /// Ids of transitions that were rewired from the original clip onto the
+    /// new back-half. Tracked so undo can restore them before the new clip is
+    /// removed (otherwise remove_clip's references_clip sweep would drop them).
+    rewired_transitions: Vec<Uuid>,
 }
 
 impl SplitClipCommand {
@@ -190,9 +194,15 @@ impl SplitClipCommand {
             split_at,
             new_clip_id: Uuid::new_v4(),
             original_duration: None,
+            rewired_transitions: Vec::new(),
         }
     }
 }
+
+/// Minimum duration on either side of a split. Prevents accidental tiny
+/// fragments from a double-click on Split. Anything smaller is unusable in
+/// practice and breaks transitions that need at least this much overlap.
+pub const MIN_SPLIT_PIECE: Duration = Duration::from_secs(1);
 
 impl Command for SplitClipCommand {
     fn execute(&mut self, state: &mut AppState) -> Result<()> {
@@ -206,6 +216,13 @@ impl Command for SplitClipCommand {
             let offset = self.split_at.saturating_sub(clip.start);
             if offset.is_zero() || offset >= clip.duration {
                 anyhow::bail!("split point outside clip bounds");
+            }
+            let remaining = clip.duration - offset;
+            if offset < MIN_SPLIT_PIECE || remaining < MIN_SPLIT_PIECE {
+                anyhow::bail!(
+                    "split would create a piece shorter than {}s",
+                    MIN_SPLIT_PIECE.as_secs()
+                );
             }
 
             self.original_duration = Some(clip.duration);
@@ -226,10 +243,49 @@ impl Command for SplitClipCommand {
             clip.duration = offset;
         }
         state.project.timeline.add_clip(new_clip);
+
+        // Rewire transitions anchored to the END of the original clip onto
+        // the new back-half. The front clip retains the original id and
+        // start time, so transitions on its START (FadeIn, Between(X, orig))
+        // correctly stay where they are.
+        self.rewired_transitions.clear();
+        for t in &mut state.project.timeline.transitions {
+            let new_pos = match t.position {
+                TransitionPosition::Between(a, b) if a == self.clip_id => {
+                    Some(TransitionPosition::Between(self.new_clip_id, b))
+                }
+                TransitionPosition::FadeOut(c) if c == self.clip_id => {
+                    Some(TransitionPosition::FadeOut(self.new_clip_id))
+                }
+                _ => None,
+            };
+            if let Some(p) = new_pos {
+                t.position = p;
+                self.rewired_transitions.push(t.id);
+            }
+        }
         Ok(())
     }
 
     fn undo(&mut self, state: &mut AppState) -> Result<()> {
+        // Reverse the transition rewiring before removing the new clip.
+        // remove_clip would otherwise drop these via its references_clip sweep.
+        for t in &mut state.project.timeline.transitions {
+            if !self.rewired_transitions.contains(&t.id) {
+                continue;
+            }
+            t.position = match t.position {
+                TransitionPosition::Between(a, b) if a == self.new_clip_id => {
+                    TransitionPosition::Between(self.clip_id, b)
+                }
+                TransitionPosition::FadeOut(c) if c == self.new_clip_id => {
+                    TransitionPosition::FadeOut(self.clip_id)
+                }
+                other => other,
+            };
+        }
+        self.rewired_transitions.clear();
+
         state.project.timeline.remove_clip(self.new_clip_id);
         if let Some(clip) = state.project.timeline.get_clip_mut(self.clip_id) {
             if let Some(dur) = self.original_duration {

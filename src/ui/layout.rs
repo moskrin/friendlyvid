@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::commands::clip_commands::{RemoveClipCommand, SplitClipCommand};
 use crate::commands::transform_commands::SetCropCommand;
@@ -11,12 +11,57 @@ use crate::ui::font_manager::FontManager;
 use crate::ui::{media_browser, preview, timeline_widget, toolbar};
 use crate::ui::timeline_widget::{JunctionKind, TimelineAction};
 
+/// Minimum time the busy/disabled state stays visible after a click, so the
+/// user always sees their click register even when the underlying work is
+/// near-instant.
+const MIN_BUSY_DISPLAY: Duration = Duration::from_millis(150);
+
+#[derive(Clone, Copy)]
+enum PendingOp {
+    Split,
+    SplitClip(uuid::Uuid),
+    Crop,
+}
+
+/// Tracks one-frame-deferred operations. A click sets `pending`; the next
+/// frame's prologue runs the work and starts a `visible_until` timer that
+/// keeps the toolbar button disabled long enough to be perceptible.
+#[derive(Default)]
+pub struct BusyState {
+    pending: Option<PendingOp>,
+    visible_until: Option<Instant>,
+}
+
+impl BusyState {
+    fn is_busy(&self) -> bool {
+        self.pending.is_some()
+            || self.visible_until.is_some_and(|t| Instant::now() < t)
+    }
+
+    fn start(&mut self, op: PendingOp, ctx: &egui::Context) {
+        if self.is_busy() {
+            return;
+        }
+        self.pending = Some(op);
+        ctx.request_repaint();
+    }
+
+    fn take_pending(&mut self) -> Option<PendingOp> {
+        let op = self.pending.take();
+        if op.is_some() {
+            self.visible_until = Some(Instant::now() + MIN_BUSY_DISPLAY);
+        }
+        op
+    }
+}
+
 pub struct LayoutState {
     pub preview_panel: preview::PreviewPanel,
     pub timeline_view: timeline_widget::TimelineView,
     pub exporting: bool,
     pub export_progress: f64,
     pub font_manager: FontManager,
+    pub busy: BusyState,
 }
 
 impl LayoutState {
@@ -27,6 +72,7 @@ impl LayoutState {
             exporting: false,
             export_progress: 0.0,
             font_manager: FontManager::new(),
+            busy: BusyState::default(),
         }
     }
 }
@@ -41,10 +87,38 @@ pub fn show_main_layout(
     // Fonts loaded last frame are now in the atlas after begin_frame rebuilt it
     layout.font_manager.begin_frame();
 
-    let can_split =
-        timeline_widget::clip_at_playhead(&state.project.timeline, state.playhead.position)
+    // Run any operation queued by last frame's click. We defer by one frame
+    // so the toolbar can render the button disabled before potentially-slow
+    // work runs, giving the user immediate visual confirmation that their
+    // click registered. visible_until then keeps the disabled appearance up
+    // for at least MIN_BUSY_DISPLAY even if the work was instant.
+    if let Some(op) = layout.busy.take_pending() {
+        match op {
+            PendingOp::Split => {
+                do_split(state, commands);
+                sync_engine(engine, &state.project);
+            }
+            PendingOp::SplitClip(clip_id) => {
+                let pos = state.playhead.position;
+                let cmd = SplitClipCommand::new(clip_id, pos);
+                if let Err(e) = commands.execute(Box::new(cmd), state) {
+                    log::error!("Split clip failed: {}", e);
+                }
+                sync_engine(engine, &state.project);
+            }
+            PendingOp::Crop => {
+                do_crop_toggle(layout, state, commands, engine);
+            }
+        }
+        ctx.request_repaint_after(MIN_BUSY_DISPLAY);
+    }
+
+    let busy = layout.busy.is_busy();
+    let can_split = !busy
+        && timeline_widget::clip_at_playhead(&state.project.timeline, state.playhead.position)
             .is_some();
     let has_selection = layout.timeline_view.selected_clip.is_some();
+    let can_crop = !busy && (has_selection || layout.preview_panel.crop_mode);
     let crop_mode = layout.preview_panel.crop_mode;
     let has_clips = !state.project.timeline.video_track.clips.is_empty();
 
@@ -81,6 +155,7 @@ pub fn show_main_layout(
             commands.can_redo(),
             can_split,
             has_selection,
+            can_crop,
             crop_mode,
             has_clips && !layout.exporting,
         )
@@ -161,12 +236,7 @@ pub fn show_main_layout(
                 sync_engine(engine, &state.project);
             }
             TimelineAction::SplitClip(clip_id) => {
-                let pos = state.playhead.position;
-                let cmd = SplitClipCommand::new(clip_id, pos);
-                if let Err(e) = commands.execute(Box::new(cmd), state) {
-                    log::error!("Split clip failed: {}", e);
-                }
-                sync_engine(engine, &state.project);
+                layout.busy.start(PendingOp::SplitClip(clip_id), ctx);
             }
             TimelineAction::AddTextClip(start) => {
                 use crate::commands::clip_commands::AddTextClipCommand;
@@ -349,8 +419,7 @@ fn handle_toolbar_actions(
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
     if action.split {
-        do_split(state, commands);
-        sync_engine(engine, &state.project);
+        layout.busy.start(PendingOp::Split, ctx);
     }
     if action.delete {
         // Clear text edit if deleting the text clip being edited
@@ -371,19 +440,7 @@ fn handle_toolbar_actions(
         sync_engine(engine, &state.project);
     }
     if action.crop {
-        if layout.preview_panel.crop_mode {
-            finish_crop(layout, state, commands, engine);
-        } else if let Some(clip_id) = layout.timeline_view.selected_clip {
-            if let Some(clip) = state.project.timeline.get_clip(clip_id) {
-                layout
-                    .preview_panel
-                    .enter_crop_mode(clip_id, clip.transform.clone());
-                // Bypass the clip's videocrop while in crop mode so the
-                // preview's UV crop operates on the uncropped source.
-                engine.set_crop_bypass(Some(clip_id));
-                sync_engine(engine, &state.project);
-            }
-        }
+        layout.busy.start(PendingOp::Crop, ctx);
     }
     if action.export {
         start_export_dialog(state, engine, layout);
@@ -617,6 +674,27 @@ fn do_split(state: &mut AppState, commands: &mut CommandHistory) {
     }
 }
 
+fn do_crop_toggle(
+    layout: &mut LayoutState,
+    state: &mut AppState,
+    commands: &mut CommandHistory,
+    engine: &mut MediaEngine,
+) {
+    if layout.preview_panel.crop_mode {
+        finish_crop(layout, state, commands, engine);
+    } else if let Some(clip_id) = layout.timeline_view.selected_clip {
+        if let Some(clip) = state.project.timeline.get_clip(clip_id) {
+            layout
+                .preview_panel
+                .enter_crop_mode(clip_id, clip.transform.clone());
+            // Bypass the clip's videocrop while in crop mode so the preview's
+            // UV crop operates on the uncropped source.
+            engine.set_crop_bypass(Some(clip_id));
+            sync_engine(engine, &state.project);
+        }
+    }
+}
+
 fn do_delete(
     state: &mut AppState,
     commands: &mut CommandHistory,
@@ -710,8 +788,7 @@ fn handle_keyboard_shortcuts(
     }
 
     if ctrl_b {
-        do_split(state, commands);
-        sync_engine(engine, &state.project);
+        layout.busy.start(PendingOp::Split, ctx);
     }
 
     if delete {

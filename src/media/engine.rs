@@ -153,11 +153,20 @@ impl MediaEngine {
 
     /// Look up or construct the GES UriClip for a model video clip, adding it
     /// to the layer on first use. Returns None on failure.
+    ///
+    /// Position must be set BEFORE add_clip: a fresh UriClip defaults to
+    /// start=0 with the source's full duration, which would overlap any clips
+    /// already in the layer (e.g. after a split). With auto_transition off,
+    /// GES rejects overlapping add_clip and the new clip never makes it onto
+    /// the timeline.
     fn get_or_create_video_clip(
         &mut self,
         clip_id: Uuid,
         path: &Path,
         layer: &ges::Layer,
+        start: Duration,
+        duration: Duration,
+        inpoint: Duration,
     ) -> Result<Option<ges::UriClip>> {
         if let Some(c) = self.video_clip_cache.get(&clip_id) {
             return Ok(Some(c.clone()));
@@ -165,6 +174,9 @@ impl MediaEngine {
         let uri = path_to_uri(path)?;
         match ges::UriClip::new(&uri) {
             Ok(c) => {
+                c.set_start(dur_to_clocktime(start));
+                c.set_duration(dur_to_clocktime(duration));
+                c.set_inpoint(dur_to_clocktime(inpoint));
                 if let Err(e) = layer.add_clip(&c) {
                     log::error!("Failed to add clip {} to GES layer: {}", clip_id, e);
                     return Ok(None);
@@ -184,6 +196,9 @@ impl MediaEngine {
         clip_id: Uuid,
         path: &Path,
         layer: &ges::Layer,
+        start: Duration,
+        duration: Duration,
+        inpoint: Duration,
     ) -> Result<Option<ges::UriClip>> {
         if let Some(c) = self.audio_clip_cache.get(&clip_id) {
             return Ok(Some(c.clone()));
@@ -191,6 +206,9 @@ impl MediaEngine {
         let uri = path_to_uri(path)?;
         match ges::UriClip::new(&uri) {
             Ok(c) => {
+                c.set_start(dur_to_clocktime(start));
+                c.set_duration(dur_to_clocktime(duration));
+                c.set_inpoint(dur_to_clocktime(inpoint));
                 if let Err(e) = layer.add_clip(&c) {
                     log::error!("Failed to add audio clip {} to GES layer: {}", clip_id, e);
                     return Ok(None);
@@ -419,29 +437,49 @@ impl MediaEngine {
 
         for (i, clip_id) in video_clips.iter().enumerate() {
             if let Some(clip) = project.timeline.get_clip(*clip_id) {
-                // Check for transition with previous clip
+                // Check for transition with previous clip. Skip if either
+                // adjacent clip is shorter than the transition: GES needs both
+                // clips present in the overlap region, and a too-short clip
+                // would force the new clip back across an even earlier clip,
+                // which GES rejects. Saved projects can hit this if a clip got
+                // trimmed below its transition length.
                 if i > 0 {
                     let prev_id = video_clips[i - 1];
                     let trans_pos = TransitionPosition::Between(prev_id, *clip_id);
                     if let Some(transition) = project.timeline.find_transition(&trans_pos) {
-                        let offset_before = accumulated_offset;
-                        accumulated_offset += transition.duration;
+                        let prev_dur = project
+                            .timeline
+                            .get_clip(prev_id)
+                            .map(|c| c.duration)
+                            .unwrap_or_default();
+                        if transition.duration <= prev_dur
+                            && transition.duration <= clip.duration
+                        {
+                            let offset_before = accumulated_offset;
+                            accumulated_offset += transition.duration;
 
-                        // Record the overlap breakpoint for time mapping
-                        let ges_start = clip.start.saturating_sub(accumulated_offset);
-                        if let Some(prev_end) = prev_ges_end {
-                            breakpoints.push(TransitionBreakpoint {
-                                ges_overlap_start: ges_start,
-                                ges_overlap_end: prev_end,
-                                offset_before,
-                                offset_after: accumulated_offset,
-                            });
-                            // Queue a manual TransitionClip at the overlap
-                            pending_transitions.push((
-                                ges_start,
-                                prev_end - ges_start,
-                                transition.kind,
-                            ));
+                            let ges_start = clip.start.saturating_sub(accumulated_offset);
+                            if let Some(prev_end) = prev_ges_end {
+                                let overlap = prev_end.saturating_sub(ges_start);
+                                if !overlap.is_zero() {
+                                    breakpoints.push(TransitionBreakpoint {
+                                        ges_overlap_start: ges_start,
+                                        ges_overlap_end: prev_end,
+                                        offset_before,
+                                        offset_after: accumulated_offset,
+                                    });
+                                    pending_transitions.push((
+                                        ges_start,
+                                        overlap,
+                                        transition.kind,
+                                    ));
+                                }
+                            }
+                        } else {
+                            log::warn!(
+                                "Skipping transition between clips: transition {:?} > clip duration (prev {:?}, next {:?})",
+                                transition.duration, prev_dur, clip.duration
+                            );
                         }
                     }
                 }
@@ -449,12 +487,20 @@ impl MediaEngine {
                 let ges_start = clip.start.saturating_sub(accumulated_offset);
 
                 if let Some(source) = project.get_source(clip.source_id) {
-                    let ges_clip =
-                        match self.get_or_create_video_clip(*clip_id, &source.path, &layer)? {
-                            Some(c) => c,
-                            None => continue,
-                        };
+                    let ges_clip = match self.get_or_create_video_clip(
+                        *clip_id,
+                        &source.path,
+                        &layer,
+                        ges_start,
+                        clip.duration,
+                        clip.in_point,
+                    )? {
+                        Some(c) => c,
+                        None => continue,
+                    };
 
+                    // Re-set for cached clips whose model values have changed.
+                    // For freshly created clips this is redundant but cheap.
                     ges_clip.set_start(dur_to_clocktime(ges_start));
                     ges_clip.set_duration(dur_to_clocktime(clip.duration));
                     ges_clip.set_inpoint(dur_to_clocktime(clip.in_point));
@@ -520,6 +566,9 @@ impl MediaEngine {
                         *clip_id,
                         &source.path,
                         &audio_layer,
+                        ges_start,
+                        clip.duration,
+                        clip.in_point,
                     )? {
                         Some(c) => c,
                         None => continue,
@@ -576,9 +625,12 @@ impl MediaEngine {
             }
             if ges <= bp.ges_overlap_end {
                 // During transition: linear interpolation (playhead moves at ~2x through overlap)
-                let ges_range = (bp.ges_overlap_end - bp.ges_overlap_start).as_secs_f64();
+                let ges_range = bp
+                    .ges_overlap_end
+                    .saturating_sub(bp.ges_overlap_start)
+                    .as_secs_f64();
                 if ges_range > 0.0 {
-                    let frac = (ges - bp.ges_overlap_start).as_secs_f64() / ges_range;
+                    let frac = ges.saturating_sub(bp.ges_overlap_start).as_secs_f64() / ges_range;
                     let model_start =
                         (bp.ges_overlap_start + bp.offset_before).as_secs_f64();
                     let model_end =
@@ -610,11 +662,18 @@ impl MediaEngine {
             }
             if model <= model_overlap_end {
                 // During transition: inverse interpolation
-                let model_range = (model_overlap_end - model_overlap_start).as_secs_f64();
+                let model_range = model_overlap_end
+                    .saturating_sub(model_overlap_start)
+                    .as_secs_f64();
                 if model_range > 0.0 {
-                    let frac = (model - model_overlap_start).as_secs_f64() / model_range;
-                    let ges_range =
-                        (bp.ges_overlap_end - bp.ges_overlap_start).as_secs_f64();
+                    let frac = model
+                        .saturating_sub(model_overlap_start)
+                        .as_secs_f64()
+                        / model_range;
+                    let ges_range = bp
+                        .ges_overlap_end
+                        .saturating_sub(bp.ges_overlap_start)
+                        .as_secs_f64();
                     return Duration::from_secs_f64(
                         bp.ges_overlap_start.as_secs_f64() + frac * ges_range,
                     );

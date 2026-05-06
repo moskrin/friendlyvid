@@ -16,12 +16,14 @@ pub struct ToolbarAction {
     pub crop: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn show_toolbar(
     ui: &mut egui::Ui,
     can_undo: bool,
     can_redo: bool,
     can_split: bool,
     has_selection: bool,
+    can_crop: bool,
     crop_mode: bool,
     has_clips: bool,
 ) -> ToolbarAction {
@@ -111,7 +113,7 @@ pub fn show_toolbar(
 
         let crop_label = if crop_mode { "Done Crop" } else { "Crop" };
         if ui
-            .add_enabled(has_selection || crop_mode, egui::Button::new(crop_label))
+            .add_enabled(can_crop, egui::Button::new(crop_label))
             .on_hover_text("Zoom/pan crop (scroll to zoom, drag to pan)")
             .clicked()
         {
